@@ -8,63 +8,71 @@ on:
       - 'Dockerfile'
       - 'docker-compose.yml'
   
-  workflow_dispatch:   # <-- Allows manual trigger
+  workflow_dispatch:
 
 jobs:
   deploy-backend:
     runs-on: ubuntu-latest
     env:
-      JUMP_HOST: ubuntu@${{ secrets.FE_PUBLIC_IP }}
-      BACKEND_HOST: ubuntu@${{ secrets.BE_PRIVATE_IP }}
       REMOTE_PATH: ~/cronvault
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup SSH key
+      - name: Setup SSH config
         env:
           KEY: ${{ secrets.SSH_KEY_PEM }}
         run: |
-          echo "$KEY" > /tmp/ssh_key && chmod 600 /tmp/ssh_key
           mkdir -p ~/.ssh
-          ssh-keyscan -H ${{ secrets.FE_PUBLIC_IP }} >> ~/.ssh/known_hosts
-          ssh -i /tmp/ssh_key -o StrictHostKeyChecking=no $JUMP_HOST \
-            "ssh-keyscan -H ${{ secrets.BE_PRIVATE_IP }} >> ~/.ssh/known_hosts" 2>/dev/null || true
+          echo "$KEY" > ~/.ssh/id_rsa && chmod 600 ~/.ssh/id_rsa
+          eval $(ssh-agent -s)
+          ssh-add ~/.ssh/id_rsa
+          
+          # Add frontend host key
+          ssh-keyscan -H ${{ secrets.FE_PUBLIC_IP }} >> ~/.ssh/known_hosts 2>/dev/null
+          
+          # Create SSH config with jump host
+          cat > ~/.ssh/config << EOF
+          Host jump
+            HostName ${{ secrets.FE_PUBLIC_IP }}
+            User ubuntu
+            IdentityFile ~/.ssh/id_rsa
+            StrictHostKeyChecking no
+          
+          Host backend
+            HostName ${{ secrets.BE_PRIVATE_IP }}
+            User ubuntu
+            ProxyCommand ssh -W %h:%p jump
+            StrictHostKeyChecking no
+            IdentityFile ~/.ssh/id_rsa
+          EOF
+          chmod 600 ~/.ssh/config
 
       - name: Backup current backend
         run: |
           TIMESTAMP=$(date +%Y%m%d-%H%M%S)
           BACKUP_PATH="${REMOTE_PATH}.backup.${TIMESTAMP}"
           echo "BACKUP_PATH=$BACKUP_PATH" >> $GITHUB_ENV
-
-          ssh -i /tmp/ssh_key -o StrictHostKeyChecking=no -J $JUMP_HOST $BACKEND_HOST \
-            "cp -r $REMOTE_PATH $BACKUP_PATH 2>/dev/null || echo 'No existing folder to backup'"
+          ssh backend "cp -r $REMOTE_PATH $BACKUP_PATH 2>/dev/null || echo 'No existing folder to backup'"
 
       - name: Ensure target directory exists
-        run: |
-          ssh -i /tmp/ssh_key -o StrictHostKeyChecking=no -J $JUMP_HOST $BACKEND_HOST \
-            "mkdir -p $REMOTE_PATH"
+        run: ssh backend "mkdir -p $REMOTE_PATH"
 
-      - name: Deploy backend files via jump host
+      - name: Deploy backend files
         run: |
-          scp -i /tmp/ssh_key -o StrictHostKeyChecking=no -J $JUMP_HOST \
-            app.py Dockerfile docker-compose.yml \
-            $BACKEND_HOST:$REMOTE_PATH/
+          scp app.py Dockerfile docker-compose.yml backend:$REMOTE_PATH/
 
       - name: Restart backend container
         run: |
-          ssh -i /tmp/ssh_key -o StrictHostKeyChecking=no -J $JUMP_HOST $BACKEND_HOST \
-            "cd $REMOTE_PATH && docker compose down && docker compose up -d --build"
+          ssh backend "cd $REMOTE_PATH && docker compose down && docker compose up -d --build"
 
       - name: Verify backend health
         run: |
           sleep 5
-          ssh -i /tmp/ssh_key -o StrictHostKeyChecking=no -J $JUMP_HOST $BACKEND_HOST \
-            "curl -sf -o /dev/null -w '%{http_code}' http://localhost:8000/health || echo 'No health endpoint'"
+          ssh backend "curl -sf -o /dev/null -w '%{http_code}' http://localhost:8000/health || echo 'No health endpoint'"
 
       - name: Cleanup old backups (keep last 5)
         if: always()
         run: |
-          ssh -i /tmp/ssh_key -o StrictHostKeyChecking=no -J $JUMP_HOST $BACKEND_HOST \
-            "ls -td ${REMOTE_PATH}.backup.* 2>/dev/null | tail -n +6 | xargs -r rm -rf || true"
+          ssh backend "ls -td ${REMOTE_PATH}.backup.* 2>/dev/null | tail -n +6 | xargs -r rm -rf || true"
