@@ -1,4 +1,5 @@
 name: CronVault — Backend Deploy via Jump Host
+
 on:
   push:
     branches: [main]
@@ -6,52 +7,72 @@ on:
       - 'app.py'
       - 'Dockerfile'
       - 'docker-compose.yml'
+  
   workflow_dispatch:
 
 jobs:
   deploy-backend:
     runs-on: ubuntu-latest
+    env:
+      REMOTE_PATH: ~/cronvault
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Backup and Prep Target Directory
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          proxy_host: ${{ secrets.FE_PUBLIC_IP }}
-          proxy_username: ubuntu
-          proxy_key: ${{ secrets.SSH_KEY_PEM }}
-          host: ${{ secrets.BE_PRIVATE_IP }}
-          username: ubuntu
-          key: ${{ secrets.SSH_KEY_PEM }}
-          script: |
-            TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-            cp -r ~/cronvault ~/cronvault.backup.$TIMESTAMP 2>/dev/null || echo "No existing folder to backup"
-            mkdir -p ~/cronvault
-            ls -td ~/cronvault.backup.* 2>/dev/null | tail -n +6 | xargs -r rm -rf || true
+      - name: Setup SSH config
+        env:
+          KEY: ${{ secrets.SSH_KEY_PEM }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$KEY" > ~/.ssh/id_rsa && chmod 600 ~/.ssh/id_rsa
+          eval $(ssh-agent -s)
+          ssh-add ~/.ssh/id_rsa
+          
+          # Add frontend host key
+          ssh-keyscan -H ${{ secrets.FE_PUBLIC_IP }} >> ~/.ssh/known_hosts 2>/dev/null
+          
+          # Create SSH config with jump host
+          cat > ~/.ssh/config << EOF
+          Host jump
+            HostName ${{ secrets.FE_PUBLIC_IP }}
+            User ubuntu
+            IdentityFile ~/.ssh/id_rsa
+            StrictHostKeyChecking no
+          
+          Host backend
+            HostName ${{ secrets.BE_PRIVATE_IP }}
+            User ubuntu
+            ProxyCommand ssh -W %h:%p jump
+            StrictHostKeyChecking no
+            IdentityFile ~/.ssh/id_rsa
+          EOF
+          chmod 600 ~/.ssh/config
 
-      - name: Deploy Backend Files
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          proxy_host: ${{ secrets.FE_PUBLIC_IP }}
-          proxy_username: ubuntu
-          proxy_key: ${{ secrets.SSH_KEY_PEM }}
-          host: ${{ secrets.BE_PRIVATE_IP }}
-          username: ubuntu
-          key: ${{ secrets.SSH_KEY_PEM }}
-          source: "app.py,Dockerfile,docker-compose.yml"
-          target: "~/cronvault/"
+      - name: Backup current backend
+        run: |
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          BACKUP_PATH="${REMOTE_PATH}.backup.${TIMESTAMP}"
+          echo "BACKUP_PATH=$BACKUP_PATH" >> $GITHUB_ENV
+          ssh backend "cp -r $REMOTE_PATH $BACKUP_PATH 2>/dev/null || echo 'No existing folder to backup'"
 
-      - name: Restart Backend Container
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          proxy_host: ${{ secrets.FE_PUBLIC_IP }}
-          proxy_username: ubuntu
-          proxy_key: ${{ secrets.SSH_KEY_PEM }}
-          host: ${{ secrets.BE_PRIVATE_IP }}
-          username: ubuntu
-          key: ${{ secrets.SSH_KEY_PEM }}
-          script: |
-            cd ~/cronvault
-            docker compose down || true
-            docker compose up -d --build
+      - name: Ensure target directory exists
+        run: ssh backend "mkdir -p $REMOTE_PATH"
+
+      - name: Deploy backend files
+        run: |
+          scp app.py Dockerfile docker-compose.yml backend:$REMOTE_PATH/
+
+      - name: Restart backend container
+        run: |
+          ssh backend "cd $REMOTE_PATH && docker compose down && docker compose up -d --build"
+
+      - name: Verify backend health
+        run: |
+          sleep 5
+          ssh backend "curl -sf -o /dev/null -w '%{http_code}' http://localhost:8000/health || echo 'No health endpoint'"
+
+      - name: Cleanup old backups (keep last 5)
+        if: always()
+        run: |
+          ssh backend "ls -td ${REMOTE_PATH}.backup.* 2>/dev/null | tail -n +6 | xargs -r rm -rf || true"
