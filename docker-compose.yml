@@ -1,0 +1,10 @@
+services:
+  cronvault:
+    build: .
+    container_name: cronvault
+    network_mode: host   # use host network so the container's source IP is the
+                         # backend host's private IP (10.0.2.204), which the DB
+                         # SG allows on 5432 (3-tier VPC)
+    environment:
+      - DATABASE_URL=postgresql://cronvault:cronvault@10.0.3.218:5432/cronvault
+    restart: unless-stopped

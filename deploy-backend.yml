@@ -1,0 +1,25 @@
+name: CronVault — Backend Only
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy-backend:
+    runs-on: ubuntu-latest
+    env:
+      BE_PRIVATE_IP: ${{ secrets.BE_PRIVATE_IP }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy backend files
+        uses: appleboy/scp-action@v0.1.6
+        with:
+          host: ${{ secrets.BE_PRIVATE_IP }}
+          username: ubuntu
+          key: ${{ secrets.SSH_KEY_PEM }}
+          source: "app.py,Dockerfile,docker-compose.yml"
+          target: "~/cronvault/"
+      - name: Restart backend container
+        run: ssh -o StrictHostKeyChecking=no -i /tmp/ssh_key ubuntu@${{ secrets.BE_PRIVATE_IP }} "cd ~/cronvault && docker compose up -d --build"
+        env:
+          KEY: ${{ secrets.SSH_KEY_PEM }}
