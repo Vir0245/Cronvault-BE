@@ -1,4 +1,4 @@
-name: CronVault — Backend Deploy via Jump Host
+name: CronVault — Backend Native SSH ECR Deploy via JumpHost
 on:
   push:
     branches: [main]
@@ -15,43 +15,57 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Backup and Prep Target Directory
-        uses: appleboy/ssh-action@v1.0.3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          proxy_host: ${{ secrets.FE_PUBLIC_IP }}
-          proxy_username: ubuntu
-          proxy_key: ${{ secrets.SSH_KEY_PEM }}
-          host: ${{ secrets.BE_PRIVATE_IP }}
-          username: ubuntu
-          key: ${{ secrets.SSH_KEY_PEM }}
-          script: |
-            TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-            cp -r ~/cronvault ~/cronvault.backup.$TIMESTAMP 2>/dev/null || echo "No existing folder to backup"
-            mkdir -p ~/cronvault
-            ls -td ~/cronvault.backup.* 2>/dev/null | tail -n +6 | xargs -r rm -rf || true
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
 
-      - name: Deploy Backend Files
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          proxy_host: ${{ secrets.FE_PUBLIC_IP }}
-          proxy_username: ubuntu
-          proxy_key: ${{ secrets.SSH_KEY_PEM }}
-          host: ${{ secrets.BE_PRIVATE_IP }}
-          username: ubuntu
-          key: ${{ secrets.SSH_KEY_PEM }}
-          source: "app.py,Dockerfile,docker-compose.yml"
-          target: "~/cronvault/"
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Restart Backend Container
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          proxy_host: ${{ secrets.FE_PUBLIC_IP }}
-          proxy_username: ubuntu
-          proxy_key: ${{ secrets.SSH_KEY_PEM }}
-          host: ${{ secrets.BE_PRIVATE_IP }}
-          username: ubuntu
-          key: ${{ secrets.SSH_KEY_PEM }}
-          script: |
+      - name: Build and Push to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: cronvault-backend
+          IMAGE_TAG: latest
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      - name: Setup Native SSH Key
+        env:
+          KEY: ${{ secrets.SSH_KEY_PEM }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          
+          # Add the jump host to known_hosts to prevent interactive terminal prompts
+          ssh-keyscan -H ${{ secrets.FE_PUBLIC_IP }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Deploy docker-compose.yml
+        env:
+          JUMP_HOST: ubuntu@${{ secrets.FE_PUBLIC_IP }}
+          BACKEND_HOST: ubuntu@${{ secrets.BE_PRIVATE_IP }}
+        run: |
+          # The -J flag tells scp to route the transfer through the JUMP_HOST
+          scp -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no -J $JUMP_HOST docker-compose.yml $BACKEND_HOST:~/cronvault/
+
+      - name: Pull and Restart Container
+        env:
+          JUMP_HOST: ubuntu@${{ secrets.FE_PUBLIC_IP }}
+          BACKEND_HOST: ubuntu@${{ secrets.BE_PRIVATE_IP }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          AWS_REGION: ap-south-1
+        run: |
+          # The -J flag opens a tunnel through the JUMP_HOST, then executes the heredoc (<< EOF) on the backend
+          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no -J $JUMP_HOST $BACKEND_HOST << EOF
             cd ~/cronvault
+            aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+            docker compose pull
             docker compose down || true
-            docker compose up -d --build
+            docker compose up -d
+          EOF
