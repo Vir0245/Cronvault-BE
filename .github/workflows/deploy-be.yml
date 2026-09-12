@@ -55,17 +55,20 @@ jobs:
           scp -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no -J $JUMP_HOST docker-compose.yml $BACKEND_HOST:~/cronvault/
 
       - name: Pull and Restart Container
-        env:
-          JUMP_HOST: ubuntu@${{ secrets.FE_PUBLIC_IP }}
-          BACKEND_HOST: ubuntu@${{ secrets.BE_PRIVATE_IP }}
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          AWS_REGION: ap-south-1
-        run: |
-          # The -J flag opens a tunnel through the JUMP_HOST, then executes the heredoc (<< EOF) on the backend
-          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no -J $JUMP_HOST $BACKEND_HOST << EOF
-            cd ~/cronvault
-            aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
-            docker compose pull
-            docker compose down || true
-            docker compose up -d
-          EOF
+    env:
+      JUMP_HOST: ubuntu@${{ secrets.FE_PUBLIC_IP }}
+      BACKEND_HOST: ubuntu@${{ secrets.BE_PRIVATE_IP }}
+      ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+      AWS_REGION: ap-south-1
+    run: |
+      ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no -J $JUMP_HOST $BACKEND_HOST << EOF
+        # Export variables so docker compose can read them on the server
+        export ECR_REGISTRY=${ECR_REGISTRY}
+        export AWS_REGION=${AWS_REGION}
+        
+        cd ~/cronvault
+        aws ecr get-login-password --region \$AWS_REGION | docker login --username AWS --password-stdin \$ECR_REGISTRY
+        docker compose pull
+        docker compose down || true
+        docker compose up -d
+      EOF
